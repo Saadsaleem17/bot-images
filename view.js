@@ -16,69 +16,110 @@ const __dirname = dirname(__filename);
 const app = express();
 const port = process.env.PORT || 3000;
 
-// Rate limiting
+// Rate limiting with reduced limits for testing
 const limiter = rateLimit({
     windowMs: 15 * 60 * 1000, // 15 minutes
-    max: 100 // limit each IP to 100 requests per windowMs
+    max: 50 // reduced from 100 to 50 for testing
 });
 
-// Security middleware
+// Security middleware with relaxed CSP for testing
 app.use(helmet({
     contentSecurityPolicy: {
         directives: {
             defaultSrc: ["'self'"],
-            imgSrc: ["'self'", "data:", "blob:"],
-            styleSrc: ["'self'", "'unsafe-inline'"],
+            imgSrc: ["'self'", "data:", "blob:", "*"],
+            styleSrc: ["'self'", "'unsafe-inline'", "*"],
         },
     },
 }));
 app.use(cors());
 app.use(limiter);
 
-// MongoDB connection with retry logic
+// MongoDB connection with retry logic and detailed logging
 let isConnected = false;
 let connectionPromise = null;
+let connectionAttempts = 0;
+const MAX_RETRIES = 3;
 
 const connectDB = async () => {
-    if (isConnected) return;
+    if (isConnected) {
+        console.log('Using existing MongoDB connection');
+        return true;
+    }
     
-    if (connectionPromise) return connectionPromise;
+    if (connectionPromise) {
+        console.log('Connection attempt in progress, waiting...');
+        return connectionPromise;
+    }
+    
+    connectionAttempts++;
+    console.log(`Attempting MongoDB connection (attempt ${connectionAttempts}/${MAX_RETRIES})...`);
     
     connectionPromise = mongoose.connect(process.env.MONGODB_URI, {
         dbName: 'whatsapp_images',
         useNewUrlParser: true,
         useUnifiedTopology: true,
-        serverSelectionTimeoutMS: 10000,
-        socketTimeoutMS: 45000,
-        connectTimeoutMS: 10000,
-        maxPoolSize: 10,
-        minPoolSize: 5,
+        serverSelectionTimeoutMS: 5000, // reduced from 10000
+        socketTimeoutMS: 30000, // reduced from 45000
+        connectTimeoutMS: 5000, // reduced from 10000
+        maxPoolSize: 5, // reduced from 10
+        minPoolSize: 1, // reduced from 5
     }).then(() => {
         isConnected = true;
-        console.log('Connected to MongoDB');
+        console.log('Successfully connected to MongoDB');
         return true;
     }).catch(error => {
         console.error('MongoDB connection error:', error);
         isConnected = false;
         connectionPromise = null;
+        
+        if (connectionAttempts < MAX_RETRIES) {
+            console.log(`Retrying connection in 2 seconds...`);
+            setTimeout(() => {
+                connectDB();
+            }, 2000);
+        }
+        
         throw error;
     });
 
     return connectionPromise;
 };
 
-// Error handling middleware
+// Health check endpoint
+app.get('/health', async (req, res) => {
+    try {
+        const dbState = mongoose.connection.readyState;
+        const status = {
+            status: 'ok',
+            mongodb: dbState === 1 ? 'connected' : 'disconnected',
+            timestamp: new Date().toISOString()
+        };
+        res.json(status);
+    } catch (error) {
+        res.status(500).json({
+            status: 'error',
+            message: error.message
+        });
+    }
+});
+
+// Error handling middleware with detailed logging
 app.use((err, req, res, next) => {
-    console.error(err.stack);
+    console.error('Error details:', {
+        message: err.message,
+        stack: err.stack,
+        timestamp: new Date().toISOString()
+    });
     res.status(500).json({
         error: 'Something went wrong!',
         message: process.env.NODE_ENV === 'development' ? err.message : undefined
     });
 });
 
-// Cache middleware
+// Cache middleware with reduced TTL for testing
 const cache = new Map();
-const CACHE_TTL = 5 * 60 * 1000; // 5 minutes
+const CACHE_TTL = 1 * 60 * 1000; // reduced from 5 to 1 minute
 
 const getCachedData = (key) => {
     const cached = cache.get(key);
@@ -95,7 +136,7 @@ const setCachedData = (key, data) => {
     });
 };
 
-// Route to serve image data
+// Route to serve image data with timeout handling
 app.get('/api/image/:id', async (req, res) => {
     try {
         const cachedImage = getCachedData(`image_${req.params.id}`);
@@ -106,7 +147,7 @@ app.get('/api/image/:id', async (req, res) => {
         }
 
         await connectDB();
-        const image = await Image.findById(req.params.id);
+        const image = await Image.findById(req.params.id).lean();
         if (!image) {
             return res.status(404).send('Image not found');
         }
@@ -125,18 +166,27 @@ app.get('/api/image/:id', async (req, res) => {
     }
 });
 
-// Route to display all images
+// Route to display all images with pagination
 app.get('/api/images', async (req, res) => {
     try {
-        const cachedImages = getCachedData('all_images');
+        const page = parseInt(req.query.page) || 1;
+        const limit = parseInt(req.query.limit) || 10;
+        const skip = (page - 1) * limit;
+
+        const cachedImages = getCachedData(`images_page_${page}`);
         if (cachedImages) {
             res.set('Cache-Control', 'public, max-age=300');
             return res.json(cachedImages);
         }
 
         await connectDB();
-        const images = await Image.find().sort({ timestamp: -1 });
-        setCachedData('all_images', images);
+        const images = await Image.find()
+            .sort({ timestamp: -1 })
+            .skip(skip)
+            .limit(limit)
+            .lean();
+
+        setCachedData(`images_page_${page}`, images);
         res.set('Cache-Control', 'public, max-age=300');
         res.json(images);
     } catch (error) {
