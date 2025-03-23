@@ -35,24 +35,36 @@ app.use(helmet({
 app.use(cors());
 app.use(limiter);
 
+// MongoDB connection with retry logic
 let isConnected = false;
+let connectionPromise = null;
 
 const connectDB = async () => {
     if (isConnected) return;
     
-    try {
-        await mongoose.connect(process.env.MONGODB_URI, {
-            dbName: 'whatsapp_images',
-            useNewUrlParser: true,
-            useUnifiedTopology: true,
-            serverSelectionTimeoutMS: 5000,
-            socketTimeoutMS: 45000,
-        });
+    if (connectionPromise) return connectionPromise;
+    
+    connectionPromise = mongoose.connect(process.env.MONGODB_URI, {
+        dbName: 'whatsapp_images',
+        useNewUrlParser: true,
+        useUnifiedTopology: true,
+        serverSelectionTimeoutMS: 10000,
+        socketTimeoutMS: 45000,
+        connectTimeoutMS: 10000,
+        maxPoolSize: 10,
+        minPoolSize: 5,
+    }).then(() => {
         isConnected = true;
         console.log('Connected to MongoDB');
-    } catch (error) {
+        return true;
+    }).catch(error => {
         console.error('MongoDB connection error:', error);
-    }
+        isConnected = false;
+        connectionPromise = null;
+        throw error;
+    });
+
+    return connectionPromise;
 };
 
 // Error handling middleware
@@ -64,14 +76,46 @@ app.use((err, req, res, next) => {
     });
 });
 
+// Cache middleware
+const cache = new Map();
+const CACHE_TTL = 5 * 60 * 1000; // 5 minutes
+
+const getCachedData = (key) => {
+    const cached = cache.get(key);
+    if (cached && Date.now() - cached.timestamp < CACHE_TTL) {
+        return cached.data;
+    }
+    return null;
+};
+
+const setCachedData = (key, data) => {
+    cache.set(key, {
+        data,
+        timestamp: Date.now()
+    });
+};
+
 // Route to serve image data
 app.get('/api/image/:id', async (req, res) => {
     try {
+        const cachedImage = getCachedData(`image_${req.params.id}`);
+        if (cachedImage) {
+            res.set('Content-Type', cachedImage.contentType);
+            res.set('Cache-Control', 'public, max-age=31536000');
+            return res.send(cachedImage.imageData);
+        }
+
         await connectDB();
         const image = await Image.findById(req.params.id);
         if (!image) {
             return res.status(404).send('Image not found');
         }
+
+        setCachedData(`image_${req.params.id}`, {
+            contentType: image.contentType,
+            imageData: image.imageData
+        });
+
         res.set('Content-Type', image.contentType);
         res.set('Cache-Control', 'public, max-age=31536000');
         res.send(image.imageData);
@@ -84,8 +128,15 @@ app.get('/api/image/:id', async (req, res) => {
 // Route to display all images
 app.get('/api/images', async (req, res) => {
     try {
+        const cachedImages = getCachedData('all_images');
+        if (cachedImages) {
+            res.set('Cache-Control', 'public, max-age=300');
+            return res.json(cachedImages);
+        }
+
         await connectDB();
         const images = await Image.find().sort({ timestamp: -1 });
+        setCachedData('all_images', images);
         res.set('Cache-Control', 'public, max-age=300');
         res.json(images);
     } catch (error) {
@@ -96,8 +147,17 @@ app.get('/api/images', async (req, res) => {
 
 app.get('/', async (req, res) => {
     try {
-        await connectDB();
-        const images = await Image.find().sort({ timestamp: -1 });
+        const cachedImages = getCachedData('all_images');
+        let images;
+        
+        if (cachedImages) {
+            images = cachedImages;
+        } else {
+            await connectDB();
+            images = await Image.find().sort({ timestamp: -1 });
+            setCachedData('all_images', images);
+        }
+
         res.set('Cache-Control', 'public, max-age=300');
         res.send(`
             <html>
